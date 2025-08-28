@@ -59,9 +59,9 @@ for dir in "${paths[@]}"; do
   echo "Cleaning $dir (files older than $days days)..."
 
   # Delete old files
-  find "$dir" -type f -mtime +"$days" -delete
+  find "$dir" -type f -mtime +"$days" -print -exec rm -f {} \;
 
   # Delete empty subdirectories, but not the root
-  find "$dir" -mindepth 1 -type d -empty -delete
+  find "$dir" -mindepth 1 -type d -empty -print -exec rmdir {} \;
 done
 
