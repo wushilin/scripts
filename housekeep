@@ -44,7 +44,7 @@ if [[ ${#paths[@]} -eq 0 ]]; then
   exit 1
 fi
 
-if [[ "$days" -le 0 ]]; then
+if [[ "$days" -lt 0 ]]; then
   echo "Error: -d must be greater than 0" >&2
   exit 1
 fi
