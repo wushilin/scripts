@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Default values
+days=0
+paths=()
+d_specified=0
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -I)
+      if [[ -n "${2:-}" ]]; then
+        paths+=("$2")
+        shift 2
+      else
+        echo "Error: -I requires a path argument" >&2
+        exit 1
+      fi
+      ;;
+    -d)
+      if [[ $d_specified -eq 1 ]]; then
+        echo "Error: -d specified multiple times" >&2
+        exit 1
+      fi
+      if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+        days="$2"
+        d_specified=1
+        shift 2
+      else
+        echo "Error: -d requires a numeric argument" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ${#paths[@]} -eq 0 ]]; then
+  echo "Error: At least one -I <path> must be specified" >&2
+  exit 1
+fi
+
+if [[ "$days" -le 0 ]]; then
+  echo "Error: -d must be greater than 0" >&2
+  exit 1
+fi
+
+# Process each path
+for dir in "${paths[@]}"; do
+  if [[ ! -d "$dir" ]]; then
+    echo "Warning: Skipping $dir (not a directory or does not exist)" >&2
+    continue
+  fi
+
+  echo "Cleaning $dir (files older than $days days)..."
+
+  # Delete old files
+  find "$dir" -type f -mtime +"$days" -delete
+
+  # Delete empty subdirectories, but not the root
+  find "$dir" -mindepth 1 -type d -empty -delete
+done
+
