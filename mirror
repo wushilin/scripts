@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_FILE=".mirrorconfig"
+interval=3       # default sleep interval
+continuous=false # default: run once
+
+usage() {
+  echo "Usage: $0 [-d] [-t seconds]"
+  echo "  -d            Run continuously (loop)"
+  echo "  -t <seconds>  Sleep interval between runs (default: 3)"
+  exit 1
+}
+
+# Parse flags
+while getopts ":dt:" opt; do
+  case $opt in
+    d) continuous=true ;;
+    t) interval="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+
+# Validate interval
+if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
+  echo "Error: interval (-t) must be a positive integer"
+  exit 1
+fi
+
+# Check config file existence
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "Error: $CONFIG_FILE not found in current directory."
+  exit 1
+fi
+
+# Load config
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+# Validate required config variables
+if [[ -z "${ssh_cmd:-}" || -z "${ssh_target:-}" ]]; then
+  echo "Error in $CONFIG_FILE: Config must define both 'ssh_cmd' and 'ssh_target'."
+  echo "ssh_cmd can be as simple as 'ssh', or 'ssh -i some-identity-file'"
+  echo "ssh_target is the remote path 'user@host:/path-to-folder'"
+  exit 1
+fi
+
+# Compute remote path (mirror to folder with same name as current dir)
+local_dir_name=$(basename "$PWD")
+if [[ "$ssh_target" == */ ]]; then
+  remote_target="$ssh_target/$local_dir_name"
+else
+  # Default behavior: append local dir name
+  remote_target="$ssh_target"
+fi
+
+sync_once() {
+  echo "🔄 Mirroring $PWD → $remote_target"
+  rsync --itemize-changes -au --delete \
+    -e "$ssh_cmd" ./ "$remote_target/"
+  echo "✅ Mirror complete to $remote_target"
+}
+
+if $continuous; then
+  trap 'echo "⏹ Stopping continuous mirror."; exit 0' SIGINT
+  while true; do
+    sync_once
+    echo "⏸ Sleeping $interval seconds..."
+    sleep "$interval"
+  done
+else
+  sync_once
+fi
