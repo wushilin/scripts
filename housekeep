@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Default values
-days=0
+days=X
 paths=()
 d_specified=0
 
@@ -41,6 +41,11 @@ done
 
 if [[ ${#paths[@]} -eq 0 ]]; then
   echo "Error: At least one -I <path> must be specified" >&2
+  exit 1
+fi
+
+if [[ "$days" = "X" ]]; then
+  echo "Error: -d x where x is max days to keep must be specified" >&2
   exit 1
 fi
 
