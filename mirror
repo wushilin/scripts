@@ -4,19 +4,22 @@ set -euo pipefail
 CONFIG_FILE=".mirrorconfig"
 interval=3       # default sleep interval
 continuous=false # default: run once
+delete=false     # default: do not delete extra files
 
 usage() {
-  echo "Usage: $0 [-d] [-t seconds]"
+  echo "Usage: $0 [-d] [-t seconds] [-F]"
   echo "  -d            Run continuously (loop)"
+  echo "  -F            Delete extra files on remote"
   echo "  -t <seconds>  Sleep interval between runs (default: 3)"
   exit 1
 }
 
 # Parse flags
-while getopts ":dt:" opt; do
+while getopts ":dt:F" opt; do
   case $opt in
     d) continuous=true ;;
     t) interval="$OPTARG" ;;
+    F) delete=true ;;
     *) usage ;;
   esac
 done
@@ -56,7 +59,11 @@ fi
 
 sync_once() {
   echo "🔄 Mirroring $PWD → $remote_target"
-  rsync --itemize-changes -au --delete \
+  DELETE_FLAG=""
+  if $delete; then
+    DELETE_FLAG="--delete"
+  fi
+  rsync --itemize-changes -au $DELETE_FLAG \
     -e "$ssh_cmd" ./ "$remote_target/"
   echo "✅ Mirror complete to $remote_target"
 }
