@@ -39,6 +39,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ $d_specified -eq 1 ]]; then
+  echo "Error: -d <days> must be specified" >&2
+  exit 1
+fi
 if [[ ${#paths[@]} -eq 0 ]]; then
   echo "Error: At least one -I <path> must be specified" >&2
   exit 1
