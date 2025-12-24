@@ -233,13 +233,45 @@ def _run_ossutil(cmd: List[str], *, show_output: bool) -> subprocess.CompletedPr
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
-def _print_indented(text: str, *, is_stderr: bool) -> None:
+def _normalize_newlines(text: str) -> str:
+    # Normalize CRLF/CR to LF so we can format output consistently.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _write_prefixed_line(
+    content: str,
+    *,
+    out,
+    indent: str,
+    colorize,
+    end: str = "\n",
+) -> None:
+    out.write(indent + "> " + colorize(content) + end)
+
+
+def _print_indented(text: str, *, is_stderr: bool, indent: str) -> None:
+    """
+    Print text with a prefix and preserve original newline endings.
+
+    - Each output line is prefixed with: <indent> + "> "
+    - If the input ends with a newline, we print a newline; if it doesn't, we don't add one.
+    """
     if not text:
         return
     out = sys.stderr if is_stderr else sys.stdout
     colorize = _stderr_c if is_stderr else _stdout_c
-    for line in text.splitlines():
-        print("  " + colorize(line), file=out)
+
+    normalized = _normalize_newlines(text)
+    for chunk in normalized.splitlines(keepends=True):
+        ends_nl = chunk.endswith("\n")
+        content = chunk[:-1] if ends_nl else chunk
+        _write_prefixed_line(
+            content,
+            out=out,
+            indent=indent,
+            colorize=colorize,
+            end="\n" if ends_nl else "",
+        )
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -258,6 +290,8 @@ def run_copy(
     dry_run: bool,
     verbose: bool,
     show_ossutil_output: bool,
+    output_indent_prefix: str,
+    log_command: bool,
 ) -> None:
     src_is_oss = _is_oss_uri(src)
     dst_is_oss = _is_oss_uri(dst)
@@ -283,10 +317,13 @@ def run_copy(
     if profile:
         cmd.extend(["--profile", profile])
 
-    if dry_run or verbose:
+    # Dynamic indentation: width of "<digits>. " (based on the file line number)
+    indent = " " * len(output_indent_prefix)
+
+    if (dry_run or verbose) or log_command:
         kind = "folder" if recursive else "file"
         print(f"[COPY] {src} -> {dst} ({kind})")
-        print(f"  {format_cmd(cmd)}")
+        _write_prefixed_line(format_cmd(cmd), out=sys.stdout, indent=indent, colorize=_info)
 
     if dry_run:
         return
@@ -313,20 +350,29 @@ def run_copy(
     proc = _run_ossutil(cmd, show_output=show_ossutil_output)
     # Print ossutil output if stdout is enabled, or if the command failed.
     if show_ossutil_output or proc.returncode != 0:
-        _print_indented(proc.stdout or "", is_stderr=False)
-        _print_indented(proc.stderr or "", is_stderr=True)
+        _print_indented(proc.stdout or "", is_stderr=False, indent=indent)
+        _print_indented(proc.stderr or "", is_stderr=True, indent=indent)
     if proc.returncode != 0:
         raise OssSyncError(f"ossutil failed (exit {proc.returncode})")
 
 
-def run_mode(*, path: str, mode_s: str, dry_run: bool, verbose: bool) -> None:
+def run_mode(
+    *,
+    path: str,
+    mode_s: str,
+    dry_run: bool,
+    verbose: bool,
+    output_indent_prefix: str,
+    log_command: bool,
+) -> None:
     target = Path(path)
     if not target.is_absolute():
         target = (Path.cwd() / target).resolve()
 
-    if dry_run or verbose:
+    indent = " " * len(output_indent_prefix)
+    if (dry_run or verbose) or log_command:
         print(f"[MODE] {target}")
-        print(f"  chmod {mode_s} {target}")
+        _write_prefixed_line(f"chmod {mode_s} {target}", out=sys.stdout, indent=indent, colorize=_info)
 
     if dry_run:
         return
@@ -339,7 +385,10 @@ def run_mode(*, path: str, mode_s: str, dry_run: bool, verbose: bool) -> None:
         mode_int = int(mode_s, 8)
         os.chmod(target, mode_int, follow_symlinks=False)
     except PermissionError:
-        ok = _run_sudo(["chmod", mode_s, "--", str(target)], dry_run=dry_run, verbose=verbose)
+        cmd = ["chmod", mode_s, "--", str(target)]
+        if log_command or verbose:
+            _write_prefixed_line(format_cmd(["sudo", "-n", *cmd]), out=sys.stdout, indent=indent, colorize=_info)
+        ok = _run_sudo(cmd, dry_run=dry_run, verbose=verbose)
         if not ok:
             print(f"[WARN] mode: failed to chmod {mode_s} {target} (and sudo retry failed)", file=sys.stderr)
     except ValueError:
@@ -348,14 +397,23 @@ def run_mode(*, path: str, mode_s: str, dry_run: bool, verbose: bool) -> None:
         print(f"[WARN] mode: failed to chmod {mode_s} {target}: {e}", file=sys.stderr)
 
 
-def run_owner(*, path: str, owner: str, dry_run: bool, verbose: bool) -> None:
+def run_owner(
+    *,
+    path: str,
+    owner: str,
+    dry_run: bool,
+    verbose: bool,
+    output_indent_prefix: str,
+    log_command: bool,
+) -> None:
     target = Path(path)
     if not target.is_absolute():
         target = (Path.cwd() / target).resolve()
 
-    if dry_run or verbose:
+    indent = " " * len(output_indent_prefix)
+    if (dry_run or verbose) or log_command:
         print(f"[OWNER] {target}")
-        print(f"  chown {owner} {target}")
+        _write_prefixed_line(f"chown {owner} {target}", out=sys.stdout, indent=indent, colorize=_info)
 
     if dry_run:
         return
@@ -368,7 +426,10 @@ def run_owner(*, path: str, owner: str, dry_run: bool, verbose: bool) -> None:
         uid, gid = _resolve_owner(owner)
         os.chown(target, uid, gid, follow_symlinks=False)
     except PermissionError:
-        ok = _run_sudo(["chown", owner, "--", str(target)], dry_run=dry_run, verbose=verbose)
+        cmd = ["chown", owner, "--", str(target)]
+        if log_command or verbose:
+            _write_prefixed_line(format_cmd(["sudo", "-n", *cmd]), out=sys.stdout, indent=indent, colorize=_info)
+        ok = _run_sudo(cmd, dry_run=dry_run, verbose=verbose)
         if not ok:
             print(f"[WARN] owner: failed to chown {owner} {target} (and sudo retry failed)", file=sys.stderr)
     except KeyError as e:
@@ -420,6 +481,8 @@ def execute_step(
                 dry_run=dry_run,
                 verbose=verbose,
                 show_ossutil_output=ctx.show_ossutil_output,
+                output_indent_prefix=f"{step.line_no}. ",
+                log_command=ctx.log_steps,
             )
             return f"Copy {src} to {dst} OK", False
 
@@ -434,17 +497,33 @@ def execute_step(
                 dry_run=dry_run,
                 verbose=verbose,
                 show_ossutil_output=ctx.show_ossutil_output,
+                output_indent_prefix=f"{step.line_no}. ",
+                log_command=ctx.log_steps,
             )
             return f"Recursively copy {src} to {dst} OK", False
 
         case "mode":
             path, mode_s = step.args
-            run_mode(path=path, mode_s=mode_s, dry_run=dry_run, verbose=verbose)
+            run_mode(
+                path=path,
+                mode_s=mode_s,
+                dry_run=dry_run,
+                verbose=verbose,
+                output_indent_prefix=f"{step.line_no}. ",
+                log_command=ctx.log_steps,
+            )
             return f"Mode {path} {mode_s} OK", False
 
         case "owner":
             path, owner_s = step.args
-            run_owner(path=path, owner=owner_s, dry_run=dry_run, verbose=verbose)
+            run_owner(
+                path=path,
+                owner=owner_s,
+                dry_run=dry_run,
+                verbose=verbose,
+                output_indent_prefix=f"{step.line_no}. ",
+                log_command=ctx.log_steps,
+            )
             return f"Owner {path} {owner_s} OK", False
 
         case _:
