@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+osssync - script-mode-only OSS push/pull helper using ossutil.
+
+Config file: defaults to ./.sync
+Each non-empty line is a command. Supports inline comments with '# ...' and quoted args.
+
+Commands:
+  profile <name>                 Set current ossutil profile for subsequent copy/rcopy
+  noprofile                      Clear current profile
+  copy  <src> <dst>              Copy a file (ossutil cp -u)
+  rcopy <src> <dst>              Copy a folder recursively (ossutil cp -u -r)
+  mode  <path> <octal>           chmod path (fail-safe; retries once with sudo -n on permission errors)
+  owner <path> <owner[:group]>   chown path (fail-safe; retries once with sudo -n on permission errors)
+
+Rules:
+  - copy/rcopy must be between local and oss://... (exactly one side is oss://)
+  - rcopy normalizes oss:// folder endpoints to end with '/'
+  - If copying a file into a local directory destination, use a trailing '/' on <dst>
+"""
+
+from __future__ import annotations
+
+import argparse
+import grp
+import os
+import pwd
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+
+class OssSyncError(Exception):
+    pass
+
+
+_OSS_URI_PREFIX = "oss://"
+
+
+def format_cmd(argv: List[str]) -> str:
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def _ossutil_bin(*, allow_missing: bool) -> str:
+    env = os.environ.get("OSSUTIL_BIN", "").strip()
+    if env:
+        return env
+    for candidate in ("ossutil", "ossutil64"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    if allow_missing:
+        return "ossutil"
+    raise OssSyncError("Could not find ossutil in PATH. Install it or set OSSUTIL_BIN=/path/to/ossutil.")
+
+
+def _sudo_bin() -> Optional[str]:
+    return shutil.which("sudo")
+
+
+def _run_sudo(cmd: List[str], *, dry_run: bool, verbose: bool) -> bool:
+    sudo = _sudo_bin()
+    if not sudo:
+        return False
+    full = [sudo, "-n", *cmd]
+    if dry_run or verbose:
+        print(f"  {format_cmd(full)}")
+    if dry_run:
+        return True
+    proc = subprocess.run(full)
+    return proc.returncode == 0
+
+
+def _resolve_owner(owner: str) -> Tuple[int, int]:
+    """
+    owner can be 'user:group', 'user', ':group', and numeric ids like '1000:1000'
+    """
+    owner = owner.strip()
+    if not owner:
+        raise OssSyncError("empty owner")
+    if ":" in owner:
+        user_s, group_s = owner.split(":", 1)
+    else:
+        user_s, group_s = owner, ""
+
+    uid = -1
+    gid = -1
+    if user_s:
+        uid = int(user_s) if user_s.isdigit() else pwd.getpwnam(user_s).pw_uid
+    if group_s:
+        gid = int(group_s) if group_s.isdigit() else grp.getgrnam(group_s).gr_gid
+    return uid, gid
+
+
+def _shlex_split_line(line: str) -> List[str]:
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    return list(lexer)
+
+
+def _is_oss_uri(s: str) -> bool:
+    return s.strip().startswith(_OSS_URI_PREFIX)
+
+
+def _ensure_trailing_slash(s: str) -> str:
+    return s if s.endswith("/") else (s + "/")
+
+
+def _basename_from_uri(uri: str) -> str:
+    u = uri.rstrip("/")
+    return u.split("/")[-1]
+
+
+@dataclass(frozen=True)
+class ScriptStep:
+    name: str  # original trimmed line
+    cmd: str
+    args: List[str]
+
+
+def parse_script_config(text: str, *, source_name: str) -> List[ScriptStep]:
+    steps: List[ScriptStep] = []
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        ctx = f"{source_name}:{idx}"
+        tokens = _shlex_split_line(raw)
+        if not tokens:
+            continue
+        cmd = tokens[0].lower()
+        args = tokens[1:]
+        if cmd not in {"profile", "noprofile", "copy", "rcopy", "mode", "owner"}:
+            raise OssSyncError(f"{ctx}: unknown command {cmd!r}")
+
+        if cmd == "profile" and len(args) != 1:
+            raise OssSyncError(f"{ctx}: usage: profile <name>")
+        if cmd == "noprofile" and args:
+            raise OssSyncError(f"{ctx}: usage: noprofile")
+        if cmd in {"copy", "rcopy"} and len(args) != 2:
+            raise OssSyncError(f"{ctx}: usage: {cmd} <src> <dst>")
+        if cmd == "mode" and len(args) != 2:
+            raise OssSyncError(f"{ctx}: usage: mode <path> <octal_mode>")
+        if cmd == "owner" and len(args) != 2:
+            raise OssSyncError(f"{ctx}: usage: owner <path> <owner|owner:group|:group>")
+
+        steps.append(ScriptStep(name=stripped, cmd=cmd, args=args))
+
+    if not steps:
+        raise OssSyncError(f"{source_name}: no steps found")
+    return steps
+
+
+def run_copy(
+    ossutil: str,
+    *,
+    src: str,
+    dst: str,
+    recursive: bool,
+    profile: Optional[str],
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    src_is_oss = _is_oss_uri(src)
+    dst_is_oss = _is_oss_uri(dst)
+    if src_is_oss == dst_is_oss:
+        raise OssSyncError("copy/rcopy requires exactly one side to be oss://...")
+
+    if recursive:
+        if src_is_oss:
+            src = _ensure_trailing_slash(src)
+        if dst_is_oss:
+            dst = _ensure_trailing_slash(dst)
+    else:
+        src_base = Path(src).name if not src_is_oss else _basename_from_uri(src)
+        if dst_is_oss and dst.endswith("/"):
+            dst = dst + src_base
+        if (not dst_is_oss) and (dst.endswith("/") or dst.endswith(os.sep)):
+            dst = str(Path(dst) / src_base)
+
+    cmd: List[str] = [ossutil, "cp", "-u"]
+    if recursive:
+        cmd.append("-r")
+    cmd.extend([src, dst])
+    if profile:
+        cmd.extend(["--profile", profile])
+
+    if dry_run or verbose:
+        kind = "folder" if recursive else "file"
+        print(f"[COPY] {src} -> {dst} ({kind})")
+        print(f"  {format_cmd(cmd)}")
+
+    if dry_run:
+        return
+
+    if not src_is_oss:
+        p = Path(src)
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        if not p.exists():
+            raise OssSyncError(f"Local source does not exist: {p}")
+        if recursive and not p.is_dir():
+            raise OssSyncError(f"rcopy expects a directory local source: {p}")
+        if (not recursive) and not p.is_file():
+            raise OssSyncError(f"copy expects a file local source: {p}")
+    else:
+        dp = Path(dst)
+        if not dp.is_absolute():
+            dp = (Path.cwd() / dp).resolve()
+        if recursive:
+            dp.mkdir(parents=True, exist_ok=True)
+        else:
+            dp.parent.mkdir(parents=True, exist_ok=True)
+
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        raise OssSyncError(f"ossutil failed (exit {proc.returncode})")
+
+
+def run_mode(*, path: str, mode_s: str, dry_run: bool, verbose: bool) -> None:
+    target = Path(path)
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+
+    if dry_run or verbose:
+        print(f"[MODE] {target}")
+        print(f"  chmod {mode_s} {target}")
+
+    if dry_run:
+        return
+
+    if not target.exists():
+        print(f"[WARN] mode: path does not exist, skipping: {target}", file=sys.stderr)
+        return
+
+    try:
+        mode_int = int(mode_s, 8)
+        os.chmod(target, mode_int, follow_symlinks=False)
+    except PermissionError:
+        ok = _run_sudo(["chmod", mode_s, "--", str(target)], dry_run=dry_run, verbose=verbose)
+        if not ok:
+            print(f"[WARN] mode: failed to chmod {mode_s} {target} (and sudo retry failed)", file=sys.stderr)
+    except ValueError:
+        print(f"[WARN] mode: invalid mode {mode_s!r} (expected octal like '0700')", file=sys.stderr)
+    except OSError as e:
+        print(f"[WARN] mode: failed to chmod {mode_s} {target}: {e}", file=sys.stderr)
+
+
+def run_owner(*, path: str, owner: str, dry_run: bool, verbose: bool) -> None:
+    target = Path(path)
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+
+    if dry_run or verbose:
+        print(f"[OWNER] {target}")
+        print(f"  chown {owner} {target}")
+
+    if dry_run:
+        return
+
+    if not target.exists():
+        print(f"[WARN] owner: path does not exist, skipping: {target}", file=sys.stderr)
+        return
+
+    try:
+        uid, gid = _resolve_owner(owner)
+        os.chown(target, uid, gid, follow_symlinks=False)
+    except PermissionError:
+        ok = _run_sudo(["chown", owner, "--", str(target)], dry_run=dry_run, verbose=verbose)
+        if not ok:
+            print(f"[WARN] owner: failed to chown {owner} {target} (and sudo retry failed)", file=sys.stderr)
+    except KeyError as e:
+        print(f"[WARN] owner: unknown user/group in owner {owner!r}: {e}", file=sys.stderr)
+    except OSError as e:
+        print(f"[WARN] owner: failed to chown {owner} {target}: {e}", file=sys.stderr)
+
+
+def run_steps(ossutil: str, *, steps: List[ScriptStep], dry_run: bool, verbose: bool) -> None:
+    current_profile: Optional[str] = None
+    for step in steps:
+        if step.cmd == "profile":
+            current_profile = step.args[0]
+            if dry_run or verbose:
+                print(f"[PROFILE] set -> {current_profile}")
+            continue
+        if step.cmd == "noprofile":
+            current_profile = None
+            if dry_run or verbose:
+                print("[PROFILE] cleared")
+            continue
+        if step.cmd == "copy":
+            run_copy(
+                ossutil,
+                src=step.args[0],
+                dst=step.args[1],
+                recursive=False,
+                profile=current_profile,
+                dry_run=dry_run,
+                verbose=verbose,
+            )
+            continue
+        if step.cmd == "rcopy":
+            run_copy(
+                ossutil,
+                src=step.args[0],
+                dst=step.args[1],
+                recursive=True,
+                profile=current_profile,
+                dry_run=dry_run,
+                verbose=verbose,
+            )
+            continue
+        if step.cmd == "mode":
+            run_mode(path=step.args[0], mode_s=step.args[1], dry_run=dry_run, verbose=verbose)
+            continue
+        if step.cmd == "owner":
+            run_owner(path=step.args[0], owner=step.args[1], dry_run=dry_run, verbose=verbose)
+            continue
+        raise OssSyncError(f"Unhandled command: {step.cmd}")
+
+
+def main(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="osssync",
+        description="Run a .sync script to copy via ossutil and apply chmod/chown (script mode).",
+    )
+    parser.add_argument("-c", "--config", default=".sync", help="Path to script config (default: ./.sync)")
+    parser.add_argument("--list", action="store_true", help="List steps and exit")
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        help="Only run steps whose full line matches exactly (can be provided multiple times)",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print commands")
+    args = parser.parse_args(argv)
+
+    config_path = Path(args.config)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise OssSyncError(f"Config file not found: {config_path}") from e
+
+    steps = parse_script_config(text, source_name=str(config_path))
+
+    if args.list:
+        for s in steps:
+            print(f"STEP: {s.name}")
+        return 0
+
+    only_set = set(args.only or [])
+    if only_set:
+        steps = [s for s in steps if s.name in only_set]
+        if not steps:
+            raise OssSyncError(f"--only names not found in config: {sorted(only_set)!r}")
+
+    ossutil = _ossutil_bin(allow_missing=bool(args.dry_run))
+    run_steps(ossutil, steps=steps, dry_run=args.dry_run, verbose=args.verbose)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except OssSyncError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(2)
+
+
