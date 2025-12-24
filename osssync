@@ -161,6 +161,7 @@ class ScriptStep:
     display: str  # canonical command without comment, for logging
     cmd: str
     args: List[str]
+    suppress_log: bool  # if true, suppress logging for this step only (supports '@cmd ...')
 
 @dataclass(frozen=True)
 class CommandSpec:
@@ -201,7 +202,14 @@ def parse_script_config(text: str, *, source_name: str) -> List[ScriptStep]:
         tokens = _shlex_split_line(raw)
         if not tokens:
             continue
-        cmd = tokens[0].lower()
+        first = tokens[0]
+        suppress_log = False
+        if first.startswith("@"):
+            suppress_log = True
+            if len(first) == 1:
+                raise OssSyncError(f"{ctx}: invalid command '@' (expected '@<command> ...')")
+            first = first[1:]
+        cmd = first.lower()
         args = tokens[1:]
         _validate_step_args(cmd, args, context=ctx)
 
@@ -212,6 +220,7 @@ def parse_script_config(text: str, *, source_name: str) -> List[ScriptStep]:
                 display=" ".join([cmd, *args]).strip(),
                 cmd=cmd,
                 args=args,
+                suppress_log=suppress_log,
             )
         )
 
@@ -476,7 +485,7 @@ def execute_step(
                 verbose=verbose,
                 show_ossutil_output=ctx.show_ossutil_output,
                 output_indent_prefix=f"{step.line_no}. ",
-                log_command=ctx.log_steps,
+                log_command=ctx.log_steps and (not step.suppress_log),
             )
             return
 
@@ -492,7 +501,7 @@ def execute_step(
                 verbose=verbose,
                 show_ossutil_output=ctx.show_ossutil_output,
                 output_indent_prefix=f"{step.line_no}. ",
-                log_command=ctx.log_steps,
+                log_command=ctx.log_steps and (not step.suppress_log),
             )
             return
 
@@ -504,7 +513,7 @@ def execute_step(
                 dry_run=dry_run,
                 verbose=verbose,
                 output_indent_prefix=f"{step.line_no}. ",
-                log_command=ctx.log_steps,
+                log_command=ctx.log_steps and (not step.suppress_log),
             )
             return
 
@@ -516,7 +525,7 @@ def execute_step(
                 dry_run=dry_run,
                 verbose=verbose,
                 output_indent_prefix=f"{step.line_no}. ",
-                log_command=ctx.log_steps,
+                log_command=ctx.log_steps and (not step.suppress_log),
             )
             return
 
@@ -531,7 +540,7 @@ def run_steps(ossutil: str, *, steps: List[ScriptStep], dry_run: bool, verbose: 
         prefix = f"{step.line_no}. "
         subprefix = " " * len(prefix)
         log_before = ctx.log_steps
-        should_log = log_before or step.cmd == "log"
+        should_log = (not step.suppress_log) and (log_before or step.cmd == "log")
 
         if should_log:
             print(_info(f"{prefix}Executing {step.display}..."))
