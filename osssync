@@ -275,6 +275,8 @@ def _print_indented(text: str, *, is_stderr: bool, indent: str) -> None:
 
 
 def _fmt_duration(seconds: float) -> str:
+    if seconds < 0.001:
+        return "<1ms"
     if seconds < 1:
         return f"{int(seconds * 1000)}ms"
     return f"{seconds:.2f}s"
@@ -535,8 +537,8 @@ def run_steps(ossutil: str, *, steps: List[ScriptStep], dry_run: bool, verbose: 
             print(_info(f"{prefix}Executing {step.display}..."))
         try:
             t0 = time.monotonic()
-            dt = _fmt_duration(time.monotonic() - t0)
             execute_step(ctx=ctx, ossutil=ossutil, step=step, dry_run=dry_run, verbose=verbose)
+            dt = _fmt_duration(time.monotonic() - t0)
             # Print done after execution. Use the original logging decision so "log off" still prints.
             if should_log:
                 print(_ok(f"{subprefix}...done ({dt})"))
