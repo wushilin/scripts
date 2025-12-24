@@ -441,30 +441,26 @@ def execute_step(
     step: ScriptStep,
     dry_run: bool,
     verbose: bool,
-) -> Tuple[str, bool]:
+) -> None:
     """
     Executes a single step.
-
-    Returns: (ok_message, always_print_ok_message)
     """
     match step.cmd:
         case "log":
             ctx.log_steps = step.args[0].lower() == "on"
-            state = "on" if ctx.log_steps else "off"
-            return f"Log {state} OK", True  # always print this change
+            return
 
         case "stdout":
             ctx.show_ossutil_output = step.args[0].lower() == "on"
-            state = "on" if ctx.show_ossutil_output else "off"
-            return f"Stdout {state} OK", False
+            return
 
         case "profile":
             ctx.profile = step.args[0]
-            return f"Profile set to {ctx.profile} OK", False
+            return
 
         case "noprofile":
             ctx.profile = None
-            return "Profile cleared OK", False
+            return
 
         case "copy":
             src, dst = step.args
@@ -480,7 +476,7 @@ def execute_step(
                 output_indent_prefix=f"{step.line_no}. ",
                 log_command=ctx.log_steps,
             )
-            return f"Copy {src} to {dst} OK", False
+            return
 
         case "rcopy":
             src, dst = step.args
@@ -496,7 +492,7 @@ def execute_step(
                 output_indent_prefix=f"{step.line_no}. ",
                 log_command=ctx.log_steps,
             )
-            return f"Recursively copy {src} to {dst} OK", False
+            return
 
         case "mode":
             path, mode_s = step.args
@@ -508,7 +504,7 @@ def execute_step(
                 output_indent_prefix=f"{step.line_no}. ",
                 log_command=ctx.log_steps,
             )
-            return f"Mode {path} {mode_s} OK", False
+            return
 
         case "owner":
             path, owner_s = step.args
@@ -520,7 +516,7 @@ def execute_step(
                 output_indent_prefix=f"{step.line_no}. ",
                 log_command=ctx.log_steps,
             )
-            return f"Owner {path} {owner_s} OK", False
+            return
 
         case _:
             # Should be unreachable due to parse-time validation, but keep it fail-safe.
@@ -531,15 +527,19 @@ def run_steps(ossutil: str, *, steps: List[ScriptStep], dry_run: bool, verbose: 
     ctx = ExecContext()
     for step in steps:
         prefix = f"{step.line_no}. "
-        ok_prefix = " " * len(prefix)
-        if ctx.log_steps:
-            print(_info(f"{prefix}Executing {step.display}"))
+        subprefix = " " * len(prefix)
+        log_before = ctx.log_steps
+        should_log = log_before or step.cmd == "log"
+
+        if should_log:
+            print(_info(f"{prefix}Executing {step.display}..."))
         try:
             t0 = time.monotonic()
-            ok_msg, always = execute_step(ctx=ctx, ossutil=ossutil, step=step, dry_run=dry_run, verbose=verbose)
             dt = _fmt_duration(time.monotonic() - t0)
-            if always or ctx.log_steps:
-                print(_ok(f"{ok_prefix}{ok_msg} ({dt})"))
+            execute_step(ctx=ctx, ossutil=ossutil, step=step, dry_run=dry_run, verbose=verbose)
+            # Print done after execution. Use the original logging decision so "log off" still prints.
+            if should_log:
+                print(_ok(f"{subprefix}...done ({dt})"))
         except Exception as e:
             # Print a single failure line then re-raise (main will exit non-zero).
             print(_err(f"{prefix}FAIL: {e}"), file=sys.stderr)
