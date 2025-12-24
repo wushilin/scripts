@@ -321,8 +321,6 @@ def run_copy(
     indent = " " * len(output_indent_prefix)
 
     if (dry_run or verbose) or log_command:
-        kind = "folder" if recursive else "file"
-        print(f"[COPY] {src} -> {dst} ({kind})")
         _write_prefixed_line(format_cmd(cmd), out=sys.stdout, indent=indent, colorize=_info)
 
     if dry_run:
@@ -371,7 +369,6 @@ def run_mode(
 
     indent = " " * len(output_indent_prefix)
     if (dry_run or verbose) or log_command:
-        print(f"[MODE] {target}")
         _write_prefixed_line(f"chmod {mode_s} {target}", out=sys.stdout, indent=indent, colorize=_info)
 
     if dry_run:
@@ -412,7 +409,6 @@ def run_owner(
 
     indent = " " * len(output_indent_prefix)
     if (dry_run or verbose) or log_command:
-        print(f"[OWNER] {target}")
         _write_prefixed_line(f"chown {owner} {target}", out=sys.stdout, indent=indent, colorize=_info)
 
     if dry_run:
@@ -534,18 +530,19 @@ def execute_step(
 def run_steps(ossutil: str, *, steps: List[ScriptStep], dry_run: bool, verbose: bool) -> None:
     ctx = ExecContext()
     for step in steps:
-        prefix = f"{step.line_no}."
+        prefix = f"{step.line_no}. "
+        ok_prefix = " " * len(prefix)
         if ctx.log_steps:
-            print(_info(f"{prefix} Executing {step.display}"))
+            print(_info(f"{prefix}Executing {step.display}"))
         try:
             t0 = time.monotonic()
             ok_msg, always = execute_step(ctx=ctx, ossutil=ossutil, step=step, dry_run=dry_run, verbose=verbose)
             dt = _fmt_duration(time.monotonic() - t0)
             if always or ctx.log_steps:
-                print(_ok(f"{prefix} {ok_msg} ({dt})"))
+                print(_ok(f"{ok_prefix}{ok_msg} ({dt})"))
         except Exception as e:
             # Print a single failure line then re-raise (main will exit non-zero).
-            print(_err(f"{prefix} FAIL: {e}"), file=sys.stderr)
+            print(_err(f"{prefix}FAIL: {e}"), file=sys.stderr)
             raise
 
 
