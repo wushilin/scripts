@@ -6,6 +6,8 @@ Config file: defaults to ./.sync
 Each non-empty line is a command. Supports inline comments with '# ...' and quoted args.
 
 Commands:
+  log on|off                      Toggle step logging (default: on)
+  stdout on|off                   Toggle printing ossutil stdout/stderr (default: on)
   profile <name>                 Set current ossutil profile for subsequent copy/rcopy
   noprofile                      Clear current profile
   copy  <src> <dst>              Copy a file (ossutil cp -u)
@@ -29,9 +31,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class OssSyncError(Exception):
@@ -43,6 +46,41 @@ _OSS_URI_PREFIX = "oss://"
 
 def format_cmd(argv: List[str]) -> str:
     return " ".join(shlex.quote(a) for a in argv)
+
+
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _c(code: str, s: str) -> str:
+    if not _use_color():
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+
+def _ok(s: str) -> str:
+    return _c("32", s)  # green
+
+
+def _info(s: str) -> str:
+    return _c("36", s)  # cyan
+
+
+def _err(s: str) -> str:
+    return _c("31", s)  # red
+
+
+def _stdout_c(s: str) -> str:
+    return _c("32", s)  # green
+
+
+def _stderr_c(s: str) -> str:
+    return _c("91", s)  # light red
 
 
 def _ossutil_bin(*, allow_missing: bool) -> str:
@@ -118,9 +156,39 @@ def _basename_from_uri(uri: str) -> str:
 
 @dataclass(frozen=True)
 class ScriptStep:
-    name: str  # original trimmed line
+    line_no: int
+    raw: str  # original trimmed line (including any inline comment)
+    display: str  # canonical command without comment, for logging
     cmd: str
     args: List[str]
+
+@dataclass(frozen=True)
+class CommandSpec:
+    usage: str
+    min_args: int
+    max_args: int
+
+
+COMMAND_SPECS: Dict[str, CommandSpec] = {
+    "log": CommandSpec("log <on|off>", 1, 1),
+    "stdout": CommandSpec("stdout <on|off>", 1, 1),
+    "profile": CommandSpec("profile <name>", 1, 1),
+    "noprofile": CommandSpec("noprofile", 0, 0),
+    "copy": CommandSpec("copy <src> <dst>", 2, 2),
+    "rcopy": CommandSpec("rcopy <src> <dst>", 2, 2),
+    "mode": CommandSpec("mode <path> <octal_mode>", 2, 2),
+    "owner": CommandSpec("owner <path> <owner|owner:group|:group>", 2, 2),
+}
+
+
+def _validate_step_args(cmd: str, args: List[str], *, context: str) -> None:
+    spec = COMMAND_SPECS.get(cmd)
+    if spec is None:
+        raise OssSyncError(f"{context}: unknown command {cmd!r}")
+    if not (spec.min_args <= len(args) <= spec.max_args):
+        raise OssSyncError(f"{context}: usage: {spec.usage}")
+    if cmd in {"stdout", "log"} and args[0].lower() not in {"on", "off"}:
+        raise OssSyncError(f"{context}: usage: {spec.usage}")
 
 
 def parse_script_config(text: str, *, source_name: str) -> List[ScriptStep]:
@@ -135,25 +203,49 @@ def parse_script_config(text: str, *, source_name: str) -> List[ScriptStep]:
             continue
         cmd = tokens[0].lower()
         args = tokens[1:]
-        if cmd not in {"profile", "noprofile", "copy", "rcopy", "mode", "owner"}:
-            raise OssSyncError(f"{ctx}: unknown command {cmd!r}")
+        _validate_step_args(cmd, args, context=ctx)
 
-        if cmd == "profile" and len(args) != 1:
-            raise OssSyncError(f"{ctx}: usage: profile <name>")
-        if cmd == "noprofile" and args:
-            raise OssSyncError(f"{ctx}: usage: noprofile")
-        if cmd in {"copy", "rcopy"} and len(args) != 2:
-            raise OssSyncError(f"{ctx}: usage: {cmd} <src> <dst>")
-        if cmd == "mode" and len(args) != 2:
-            raise OssSyncError(f"{ctx}: usage: mode <path> <octal_mode>")
-        if cmd == "owner" and len(args) != 2:
-            raise OssSyncError(f"{ctx}: usage: owner <path> <owner|owner:group|:group>")
-
-        steps.append(ScriptStep(name=stripped, cmd=cmd, args=args))
+        steps.append(
+            ScriptStep(
+                line_no=idx,
+                raw=stripped,
+                display=" ".join([cmd, *args]).strip(),
+                cmd=cmd,
+                args=args,
+            )
+        )
 
     if not steps:
         raise OssSyncError(f"{source_name}: no steps found")
     return steps
+
+
+@dataclass
+class ExecContext:
+    profile: Optional[str] = None
+    show_ossutil_output: bool = True  # stdout/stderr printing for ossutil
+    log_steps: bool = True
+
+
+def _run_ossutil(cmd: List[str], *, show_output: bool) -> subprocess.CompletedProcess:
+    # Always capture so we can format output nicely (indent + color).
+    # If show_output is False, we'll still print captured output on failure.
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def _print_indented(text: str, *, is_stderr: bool) -> None:
+    if not text:
+        return
+    out = sys.stderr if is_stderr else sys.stdout
+    colorize = _stderr_c if is_stderr else _stdout_c
+    for line in text.splitlines():
+        print("  " + colorize(line), file=out)
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{int(seconds * 1000)}ms"
+    return f"{seconds:.2f}s"
 
 
 def run_copy(
@@ -165,6 +257,7 @@ def run_copy(
     profile: Optional[str],
     dry_run: bool,
     verbose: bool,
+    show_ossutil_output: bool,
 ) -> None:
     src_is_oss = _is_oss_uri(src)
     dst_is_oss = _is_oss_uri(dst)
@@ -217,7 +310,11 @@ def run_copy(
         else:
             dp.parent.mkdir(parents=True, exist_ok=True)
 
-    proc = subprocess.run(cmd)
+    proc = _run_ossutil(cmd, show_output=show_ossutil_output)
+    # Print ossutil output if stdout is enabled, or if the command failed.
+    if show_ossutil_output or proc.returncode != 0:
+        _print_indented(proc.stdout or "", is_stderr=False)
+        _print_indented(proc.stderr or "", is_stderr=True)
     if proc.returncode != 0:
         raise OssSyncError(f"ossutil failed (exit {proc.returncode})")
 
@@ -280,48 +377,97 @@ def run_owner(*, path: str, owner: str, dry_run: bool, verbose: bool) -> None:
         print(f"[WARN] owner: failed to chown {owner} {target}: {e}", file=sys.stderr)
 
 
-def run_steps(ossutil: str, *, steps: List[ScriptStep], dry_run: bool, verbose: bool) -> None:
-    current_profile: Optional[str] = None
-    for step in steps:
-        if step.cmd == "profile":
-            current_profile = step.args[0]
-            if dry_run or verbose:
-                print(f"[PROFILE] set -> {current_profile}")
-            continue
-        if step.cmd == "noprofile":
-            current_profile = None
-            if dry_run or verbose:
-                print("[PROFILE] cleared")
-            continue
-        if step.cmd == "copy":
+def execute_step(
+    *,
+    ctx: ExecContext,
+    ossutil: str,
+    step: ScriptStep,
+    dry_run: bool,
+    verbose: bool,
+) -> Tuple[str, bool]:
+    """
+    Executes a single step.
+
+    Returns: (ok_message, always_print_ok_message)
+    """
+    match step.cmd:
+        case "log":
+            ctx.log_steps = step.args[0].lower() == "on"
+            state = "on" if ctx.log_steps else "off"
+            return f"Log {state} OK", True  # always print this change
+
+        case "stdout":
+            ctx.show_ossutil_output = step.args[0].lower() == "on"
+            state = "on" if ctx.show_ossutil_output else "off"
+            return f"Stdout {state} OK", False
+
+        case "profile":
+            ctx.profile = step.args[0]
+            return f"Profile set to {ctx.profile} OK", False
+
+        case "noprofile":
+            ctx.profile = None
+            return "Profile cleared OK", False
+
+        case "copy":
+            src, dst = step.args
             run_copy(
                 ossutil,
-                src=step.args[0],
-                dst=step.args[1],
+                src=src,
+                dst=dst,
                 recursive=False,
-                profile=current_profile,
+                profile=ctx.profile,
                 dry_run=dry_run,
                 verbose=verbose,
+                show_ossutil_output=ctx.show_ossutil_output,
             )
-            continue
-        if step.cmd == "rcopy":
+            return f"Copy {src} to {dst} OK", False
+
+        case "rcopy":
+            src, dst = step.args
             run_copy(
                 ossutil,
-                src=step.args[0],
-                dst=step.args[1],
+                src=src,
+                dst=dst,
                 recursive=True,
-                profile=current_profile,
+                profile=ctx.profile,
                 dry_run=dry_run,
                 verbose=verbose,
+                show_ossutil_output=ctx.show_ossutil_output,
             )
-            continue
-        if step.cmd == "mode":
-            run_mode(path=step.args[0], mode_s=step.args[1], dry_run=dry_run, verbose=verbose)
-            continue
-        if step.cmd == "owner":
-            run_owner(path=step.args[0], owner=step.args[1], dry_run=dry_run, verbose=verbose)
-            continue
-        raise OssSyncError(f"Unhandled command: {step.cmd}")
+            return f"Recursively copy {src} to {dst} OK", False
+
+        case "mode":
+            path, mode_s = step.args
+            run_mode(path=path, mode_s=mode_s, dry_run=dry_run, verbose=verbose)
+            return f"Mode {path} {mode_s} OK", False
+
+        case "owner":
+            path, owner_s = step.args
+            run_owner(path=path, owner=owner_s, dry_run=dry_run, verbose=verbose)
+            return f"Owner {path} {owner_s} OK", False
+
+        case _:
+            # Should be unreachable due to parse-time validation, but keep it fail-safe.
+            raise OssSyncError(f"Unhandled command: {step.cmd}")
+
+
+def run_steps(ossutil: str, *, steps: List[ScriptStep], dry_run: bool, verbose: bool) -> None:
+    ctx = ExecContext()
+    for step in steps:
+        prefix = f"{step.line_no}."
+        if ctx.log_steps:
+            print(_info(f"{prefix} Executing {step.display}"))
+        try:
+            t0 = time.monotonic()
+            ok_msg, always = execute_step(ctx=ctx, ossutil=ossutil, step=step, dry_run=dry_run, verbose=verbose)
+            dt = _fmt_duration(time.monotonic() - t0)
+            if always or ctx.log_steps:
+                print(_ok(f"{prefix} {ok_msg} ({dt})"))
+        except Exception as e:
+            # Print a single failure line then re-raise (main will exit non-zero).
+            print(_err(f"{prefix} FAIL: {e}"), file=sys.stderr)
+            raise
 
 
 def main(argv: List[str]) -> int:
@@ -351,12 +497,12 @@ def main(argv: List[str]) -> int:
 
     if args.list:
         for s in steps:
-            print(f"STEP: {s.name}")
+            print(f"STEP: {s.raw}")
         return 0
 
     only_set = set(args.only or [])
     if only_set:
-        steps = [s for s in steps if s.name in only_set]
+        steps = [s for s in steps if s.raw in only_set]
         if not steps:
             raise OssSyncError(f"--only names not found in config: {sorted(only_set)!r}")
 
@@ -371,6 +517,7 @@ if __name__ == "__main__":
     except OssSyncError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(2)
+
 
 
 

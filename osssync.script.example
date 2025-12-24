@@ -2,6 +2,8 @@
 # Copy this file into your project directory as ".sync", then run:
 #   /home/code/home_workspace/scripts/osssync --dry-run
 
+log on
+stdout on
 profile sz # current context profile switched to sz
 copy file1 oss://test/file2 # copy file
 rcopy folder1 oss://test/folder1 # copy folder
@@ -12,5 +14,3 @@ rcopy oss://test/folder1 /tmp/folder2
 mode /tmp/test 0700 # chmod
 owner /tmp/test root:root # owner and group
 owner /tmp/test root # owner only
-
-
