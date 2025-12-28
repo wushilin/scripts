@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -56,7 +57,7 @@ func makeMessage(r *rand.Rand, maxLen int) string {
 	return b.String()
 }
 
-func runSpammer(ctx context.Context, w *os.File, rate float64, lineLen int, r *rand.Rand) {
+func runSpammer(ctx context.Context, w io.Writer, rate float64, lineLen int, r *rand.Rand) {
 	if rate <= 0 {
 		<-ctx.Done()
 		return
@@ -98,11 +99,24 @@ func runSpammer(ctx context.Context, w *os.File, rate float64, lineLen int, r *r
 	}
 }
 
+func openOutFile(path string, overwrite bool) (*os.File, error) {
+	flags := os.O_CREATE | os.O_WRONLY
+	if overwrite {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_APPEND
+	}
+	return os.OpenFile(path, flags, 0o644)
+}
+
 func main() {
 	var (
 		lineLen    = flag.Int("line-length", 80, "max characters for the random message portion")
 		stdoutRate = flag.Float64("stdout-rate", 0, "stdout lines per second (0 disables)")
 		stderrRate = flag.Float64("stderr-rate", 0, "stderr lines per second (0 disables)")
+		stdoutFile = flag.String("stdout-file", "", "if set, write stdout stream to this file (default: process stdout)")
+		stderrFile = flag.String("stderr-file", "", "if set, write stderr stream to this file (default: process stderr)")
+		overwrite  = flag.Bool("overwrite", false, "if set, truncate output files instead of appending")
 	)
 	flag.Parse()
 
@@ -114,12 +128,41 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	outW := io.Writer(os.Stdout)
+	errW := io.Writer(os.Stderr)
+	var outF, errF *os.File
+	var err error
+
+	if *stdoutFile != "" {
+		outF, err = openOutFile(*stdoutFile, *overwrite)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to open --stdout-file %q: %v\n", *stdoutFile, err)
+			os.Exit(2)
+		}
+		outW = outF
+	}
+	if *stderrFile != "" {
+		errF, err = openOutFile(*stderrFile, *overwrite)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to open --stderr-file %q: %v\n", *stderrFile, err)
+			_ = outF.Close()
+			os.Exit(2)
+		}
+		errW = errF
+	}
+	if outF != nil {
+		defer func() { _ = outF.Close() }()
+	}
+	if errF != nil {
+		defer func() { _ = errF.Close() }()
+	}
+
 	seed := time.Now().UnixNano()
 	r1 := rand.New(rand.NewSource(seed))
 	r2 := rand.New(rand.NewSource(seed + 1))
 
-	go runSpammer(ctx, os.Stdout, *stdoutRate, *lineLen, r1)
-	go runSpammer(ctx, os.Stderr, *stderrRate, *lineLen, r2)
+	go runSpammer(ctx, outW, *stdoutRate, *lineLen, r1)
+	go runSpammer(ctx, errW, *stderrRate, *lineLen, r2)
 
 	<-ctx.Done()
 }
