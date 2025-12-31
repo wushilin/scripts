@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -152,6 +153,12 @@ static int set_nonblocking(int fd) {
     if (flags < 0) return -1;
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
     return 0;
+}
+
+static void set_tcp_nodelay(int fd) {
+    int one = 1;
+    // Best-effort: reduces interactive latency for small packets (e.g., SSH).
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
 static int make_pipe_nb(int p[2]) {
@@ -611,6 +618,8 @@ int main(int argc, char **argv) {
                         continue;
                     }
                     set_nonblocking(remote_sock);
+                    set_tcp_nodelay(client_sock);
+                    set_tcp_nodelay(remote_sock);
                     log_conn(cid, "remote connected %s:%d", specs[li].remote_host, specs[li].remote_port);
 
                     if (free_top <= 0) {
