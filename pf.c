@@ -161,6 +161,16 @@ static void set_tcp_nodelay(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
+static void set_tcp_quickack(int fd) {
+#ifdef TCP_QUICKACK
+    int one = 1;
+    // Best-effort: reduce delayed-ACK latency for interactive traffic.
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#else
+    (void)fd;
+#endif
+}
+
 static int make_pipe_nb(int p[2]) {
     if (pipe2(p, O_NONBLOCK | O_CLOEXEC) != 0) return -1;
     return 0;
@@ -620,6 +630,8 @@ int main(int argc, char **argv) {
                     set_nonblocking(remote_sock);
                     set_tcp_nodelay(client_sock);
                     set_tcp_nodelay(remote_sock);
+                    set_tcp_quickack(client_sock);
+                    set_tcp_quickack(remote_sock);
                     log_conn(cid, "remote connected %s:%d", specs[li].remote_host, specs[li].remote_port);
 
                     if (free_top <= 0) {
@@ -710,7 +722,7 @@ int main(int argc, char **argv) {
         }
 
         // Pump splice state machines for any connection that had an event
-        const unsigned int sflags = SPLICE_F_NONBLOCK | SPLICE_F_MORE;
+        const unsigned int sflags = SPLICE_F_NONBLOCK;
         for (int idx=0; idx<MAX_CONNECTIONS; idx++) {
             if (!to_pump[idx]) continue;
             conn_pair *c = &conns[idx];
