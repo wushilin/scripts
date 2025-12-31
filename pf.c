@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -32,6 +33,7 @@ typedef struct {
 typedef struct {
     int client_sock;
     int remote_sock;
+    char conn_id[7]; // 6 chars + NUL
     char client_addr[64];
     char remote_addr[270];
     size_t bytes_c2r; // client -> remote
@@ -61,6 +63,56 @@ void log_msg(const char *fmt, ...) {
     va_end(ap);
     printf("\n");
     fflush(stdout);
+}
+
+// Utility to print timestamped log with connection id prefix
+void log_conn(const char *conn_id, const char *fmt, ...) {
+    va_list ap;
+    char timestr[64];
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ts.tv_sec = time(NULL);
+        ts.tv_nsec = 0;
+    }
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm);
+    long ms = ts.tv_nsec / 1000000L;
+
+    printf("[%s.%03ld] [%s] ", timestr, ms, (conn_id && conn_id[0]) ? conn_id : "??????");
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+    fflush(stdout);
+}
+
+static void gen_conn_id(char out[7]) {
+    static const char charset[] =
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789";
+    // 62 chars
+
+    int fd = open("/dev/urandom", O_RDONLY);
+    unsigned char b;
+    for (int i = 0; i < 6; i++) {
+        int ok = 0;
+        if (fd >= 0) {
+            // rejection sample to avoid modulo bias (largest multiple of 62 under 256 is 248)
+            for (int tries = 0; tries < 128; tries++) {
+                ssize_t r = read(fd, &b, 1);
+                if (r != 1) break;
+                if (b < 248) { out[i] = charset[b % 62]; ok = 1; break; }
+            }
+        }
+        if (!ok) {
+            // fallback (not crypto-strong, but keeps behavior working)
+            out[i] = charset[(unsigned)(rand() % 62)];
+        }
+    }
+    if (fd >= 0) close(fd);
+    out[6] = 0;
 }
 
 // Connect to remote host
@@ -309,26 +361,31 @@ int main(int argc, char **argv) {
                 int client_sock = accept(listen_socks[i], (struct sockaddr*)&caddr, &clen);
                 if (client_sock<0) { perror("accept"); continue; }
 
+                char cid[7];
+                gen_conn_id(cid);
+
                 char caddrstr[64];
                 inet_ntop(AF_INET, &caddr.sin_addr, caddrstr, sizeof(caddrstr));
-                log_msg("Client connect OK: %s:%d", caddrstr, ntohs(caddr.sin_port));
+                log_conn(cid, "Client connect OK: %s:%d", caddrstr, ntohs(caddr.sin_port));
 
                 int remote_sock = connect_remote(specs[i].remote_host, specs[i].remote_port);
                 if (remote_sock<0) {
-                    log_msg("Remote connect NOT OK: %s:%d", specs[i].remote_host, specs[i].remote_port);
+                    log_conn(cid, "Remote connect NOT OK: %s:%d", specs[i].remote_host, specs[i].remote_port);
                     close(client_sock);
                     continue;
                 }
-                log_msg("Remote connect OK: %s:%d", specs[i].remote_host, specs[i].remote_port);
+                log_conn(cid, "Remote connect OK: %s:%d", specs[i].remote_host, specs[i].remote_port);
 
                 if (nconns>=MAX_CONNECTIONS) {
-                    log_msg("Too many connections, dropping client %s", caddrstr);
+                    log_conn(cid, "Too many connections, dropping client %s", caddrstr);
                     close(client_sock);
                     close(remote_sock);
                     continue;
                 }
                 conns[nconns].client_sock = client_sock;
                 conns[nconns].remote_sock = remote_sock;
+                strncpy(conns[nconns].conn_id, cid, sizeof(conns[nconns].conn_id)-1);
+                conns[nconns].conn_id[sizeof(conns[nconns].conn_id)-1] = 0;
                 strncpy(conns[nconns].client_addr, caddrstr, sizeof(conns[nconns].client_addr)-1);
                 conns[nconns].client_addr[sizeof(conns[nconns].client_addr)-1] = 0;
                 snprintf(conns[nconns].remote_addr, sizeof(conns[nconns].remote_addr),"%s:%d",
@@ -352,16 +409,16 @@ int main(int argc, char **argv) {
             // client -> remote
             if (fds[nbind + i*2].revents & POLLIN) {
                 n = read(conns[i].client_sock, buf, sizeof(buf));
-                if (n<=0) { log_msg("Client disconnect: %s", conns[i].client_addr); closed=1; close_reason="client disconnect"; }
-                else if (write(conns[i].remote_sock, buf, n)!=n) { log_msg("Write to remote failed: %s", conns[i].remote_addr); closed=1; close_reason="write to remote failed"; }
+                if (n<=0) { log_conn(conns[i].conn_id, "Client disconnect: %s", conns[i].client_addr); closed=1; close_reason="client disconnect"; }
+                else if (write(conns[i].remote_sock, buf, n)!=n) { log_conn(conns[i].conn_id, "Write to remote failed: %s", conns[i].remote_addr); closed=1; close_reason="write to remote failed"; }
                 else { conns[i].bytes_c2r += (size_t)n; clock_gettime(CLOCK_MONOTONIC, &conns[i].last_activity_ts); }
             }
 
             // remote -> client
             if (!closed && (fds[nbind + i*2 +1].revents & POLLIN)) {
                 n = read(conns[i].remote_sock, buf, sizeof(buf));
-                if (n<=0) { log_msg("Remote disconnect: %s", conns[i].remote_addr); closed=1; close_reason="remote disconnect"; }
-                else if (write(conns[i].client_sock, buf, n)!=n) { log_msg("Write to client failed: %s", conns[i].client_addr); closed=1; close_reason="write to client failed"; }
+                if (n<=0) { log_conn(conns[i].conn_id, "Remote disconnect: %s", conns[i].remote_addr); closed=1; close_reason="remote disconnect"; }
+                else if (write(conns[i].client_sock, buf, n)!=n) { log_conn(conns[i].conn_id, "Write to client failed: %s", conns[i].client_addr); closed=1; close_reason="write to client failed"; }
                 else { conns[i].bytes_r2c += (size_t)n; clock_gettime(CLOCK_MONOTONIC, &conns[i].last_activity_ts); }
             }
 
@@ -372,9 +429,9 @@ int main(int argc, char **argv) {
                 clock_gettime(CLOCK_MONOTONIC, &now_ts);
                 long long idle_ms = elapsed_ms(&conns[i].last_activity_ts, &now_ts);
                 if (idle_ms > timeout_ms) {
-                    log_msg("Idle timeout: %s <-> %s (idle %.3fs > %llds)",
-                            conns[i].client_addr, conns[i].remote_addr,
-                            (double)idle_ms / 1000.0, idle_timeout_secs);
+                    log_conn(conns[i].conn_id, "Idle timeout: %s <-> %s (idle %.3fs > %llds)",
+                             conns[i].client_addr, conns[i].remote_addr,
+                             (double)idle_ms / 1000.0, idle_timeout_secs);
                     closed = 1;
                     close_reason = "idle timeout";
                 }
@@ -389,9 +446,9 @@ int main(int argc, char **argv) {
                 struct timespec end_ts;
                 clock_gettime(CLOCK_MONOTONIC, &end_ts);
                 long long ms = elapsed_ms(&conns[i].start_ts, &end_ts);
-                log_msg("Connection closed: %s <-> %s, uptime %.3fs, bytes: client->remote %s, remote->client %s%s%s",
-                        conns[i].client_addr, conns[i].remote_addr, (double)ms / 1000.0, hbuf, rbuf,
-                        close_reason ? ", reason: " : "", close_reason ? close_reason : "");
+                log_conn(conns[i].conn_id, "Connection closed: %s <-> %s, uptime %.3fs, bytes: client->remote %s, remote->client %s%s%s",
+                         conns[i].client_addr, conns[i].remote_addr, (double)ms / 1000.0, hbuf, rbuf,
+                         close_reason ? ", reason: " : "", close_reason ? close_reason : "");
 
                 if (i<nconns-1) conns[i]=conns[nconns-1];
                 nconns--;
