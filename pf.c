@@ -266,6 +266,8 @@ static void print_usage(FILE *out, const char *prog) {
     fprintf(out,
             "Usage:\n"
             "  %s [-h|--help] [-log-no-time] [-log-no-stats] [-stats-interval-secs N] [-idle-timeout-secs N] -L [local_ip:]local_port@remote_host[:remote_port] [-L ...]\n"
+            "  %s [-h|--help] [-log-no-time] [-log-no-stats] [-stats-interval-secs N] [-idle-timeout-secs N]\n"
+            "     (if no -L is provided, specs are loaded from ./pf.conf)\n"
             "\n"
             "Options:\n"
             "  -h, --help              Show this help\n"
@@ -273,6 +275,8 @@ static void print_usage(FILE *out, const char *prog) {
             "                           spec format: [local_ip:]local_port@remote_host[:remote_port]\n"
             "                           local_ip defaults to 127.0.0.1 if omitted\n"
             "                           remote_port defaults to local_port if omitted\n"
+            "  pf.conf                 If no -L is provided, pf reads specs from ./pf.conf\n"
+            "                           One spec per line, up to MAX_BIND lines.\n"
             "  -idle-timeout-secs N    Close a connection if no traffic flows in either direction for N seconds\n"
             "                           Default: -1 (disabled)\n"
             "  -log-no-time            Omit pf's own timestamp prefix (useful under systemd/journald)\n"
@@ -283,15 +287,45 @@ static void print_usage(FILE *out, const char *prog) {
             "Examples:\n"
             "  %s -L 0.0.0.0:23@mama.wushilin.net:22222\n"
             "  %s -idle-timeout-secs 5 -log-no-time -L 80@target-host.com:80\n",
-            prog, prog, prog);
+            prog, prog, prog, prog);
+}
+
+static int load_specs_from_file(const char *path, forward_spec *specs, int *nbind) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char line[1024];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        // trim leading whitespace
+        char *s = line;
+        while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+        // strip trailing newline/whitespace
+        char *end = s + strlen(s);
+        while (end > s && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
+        *end = 0;
+
+        if (*s == 0) continue;          // skip empty
+        if (*s == '#') continue;        // skip comment lines
+
+        if (*nbind >= MAX_BIND) {
+            fprintf(stderr, "Too many specs in %s (max %d)\n", path, MAX_BIND);
+            fclose(f);
+            return -2;
+        }
+        if (parse_spec(s, &specs[*nbind]) < 0) {
+            fprintf(stderr, "Invalid spec in %s line %d: %s\n", path, lineno, s);
+            fclose(f);
+            return -3;
+        }
+        (*nbind)++;
+    }
+    fclose(f);
+    return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc<2) {
-        print_usage(stderr, argv[0]);
-        return 1;
-    }
-
     long long idle_timeout_secs = -1; // -1 disables idle timeout
 
     forward_spec *specs = calloc((size_t)MAX_BIND, sizeof(*specs));
@@ -345,7 +379,14 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (nbind==0) { fprintf(stderr,"No -L specified\n"); return 1; }
+    if (nbind==0) {
+        // If no -L is provided, load specs from ./pf.conf in the current working directory.
+        if (load_specs_from_file("./pf.conf", specs, &nbind) != 0 || nbind == 0) {
+            fprintf(stderr, "No -L specified and no usable specs found in ./pf.conf\n\n");
+            print_usage(stderr, argv[0]);
+            return 1;
+        }
+    }
 
     // Seed rand() for gen_conn_id() fallback path.
     srand((unsigned)(time(NULL) ^ getpid()));
