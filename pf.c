@@ -46,6 +46,7 @@ typedef struct {
     struct timespec last_activity_ts; // CLOCK_MONOTONIC, updated on any successful relay
     int client_read_open; // whether client can still send data to us (read side open)
     int remote_read_open; // whether remote can still send data to us (read side open)
+    int remote_connecting; // nonblocking connect() in progress (remote_sock not ready for splice egress/ingress yet)
     int pending_shutdown_remote_wr; // shutdown(remote, SHUT_WR) once c2r pipe drains
     int pending_shutdown_client_wr; // shutdown(client, SHUT_WR) once r2c pipe drains
 
@@ -171,6 +172,21 @@ static void set_tcp_quickack(int fd) {
 #endif
 }
 
+static void format_local_sockaddr(int fd, char *buf, size_t buflen) {
+    struct sockaddr_in sa;
+    socklen_t slen = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &slen) != 0) {
+        snprintf(buf, buflen, "?");
+        return;
+    }
+    char ip[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip))) {
+        snprintf(buf, buflen, "?");
+        return;
+    }
+    snprintf(buf, buflen, "%s:%u", ip, (unsigned)ntohs(sa.sin_port));
+}
+
 static int make_pipe_nb(int p[2]) {
     if (pipe2(p, O_NONBLOCK | O_CLOEXEC) != 0) return -1;
     return 0;
@@ -197,6 +213,11 @@ static uint32_t conn_ep_events_client(const conn_pair *c) {
 
 static uint32_t conn_ep_events_remote(const conn_pair *c) {
     uint32_t ev = EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+    if (c->remote_connecting) {
+        // For nonblocking connect completion (EPOLLOUT) / error.
+        ev |= EPOLLOUT;
+        return ev;
+    }
     if (c->remote_read_open && !c->r2c_ingress_blocked) ev |= EPOLLIN;
     if (c->c2r_in_pipe > 0) ev |= EPOLLOUT;
     return ev;
@@ -215,7 +236,7 @@ static void *stats_thread_main(void *arg) {
     return NULL;
 }
 
-// Connect to remote host
+// Connect to remote host (blocking). Left for compatibility; main loop uses nonblocking connect.
 int connect_remote(const char *host, int port) {
     struct addrinfo hints, *res;
     int sock;
@@ -244,6 +265,49 @@ int connect_remote(const char *host, int port) {
 
     freeaddrinfo(res);
     return sock;
+}
+
+// Start a nonblocking connect to remote host.
+// Returns:
+//  -1 on error (nothing created)
+//   0 if connected immediately
+//   1 if connect is in progress (EINPROGRESS)
+static int connect_remote_nb(const char *host, int port, int *out_sock) {
+    struct addrinfo hints, *res;
+    int sock;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+
+    if (getaddrinfo(host, portstr, &hints, &res) != 0) {
+        perror("getaddrinfo");
+        return -1;
+    }
+
+    sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { perror("socket"); freeaddrinfo(res); return -1; }
+
+    if (set_nonblocking(sock) != 0) { perror("fcntl O_NONBLOCK"); close(sock); freeaddrinfo(res); return -1; }
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        if (errno == EINPROGRESS) {
+            freeaddrinfo(res);
+            *out_sock = sock;
+            return 1;
+        }
+        perror("connect");
+        close(sock);
+        freeaddrinfo(res);
+        return -1;
+    }
+
+    freeaddrinfo(res);
+    *out_sock = sock;
+    return 0;
 }
 
 // Parse -L argument
@@ -579,7 +643,7 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &now_ts);
             long long min_rem = LLONG_MAX;
             for (int idx=0; idx<MAX_CONNECTIONS; idx++) {
-                if (conns[idx].client_sock == 0 && conns[idx].remote_sock == 0) continue;
+                if (conns[idx].client_sock < 0 && conns[idx].remote_sock < 0) continue;
                 long long idle_ms = elapsed_ms(&conns[idx].last_activity_ts, &now_ts);
                 long long rem = tms - idle_ms;
                 if (rem < 0) rem = 0;
@@ -596,9 +660,10 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // track which conns need pumping this round
-        unsigned char *to_pump = calloc((size_t)MAX_CONNECTIONS, 1);
-        if (!to_pump) { perror("calloc to_pump"); return 1; }
+        // track which conns need pumping this round and why:
+        // bit0: client socket event, bit1: remote socket event, bit2: c2r pipe write end writable, bit3: r2c pipe write end writable
+        unsigned char *pump_flags = calloc((size_t)MAX_CONNECTIONS, 1);
+        if (!pump_flags) { perror("calloc pump_flags"); return 1; }
 
         for (int e=0; e<n; e++) {
             ep_ctx *ctx = (ep_ctx *)evs[e].data.ptr;
@@ -621,18 +686,26 @@ int main(int argc, char **argv) {
                     inet_ntop(AF_INET, &caddr.sin_addr, caddrstr, sizeof(caddrstr));
                     log_conn(cid, "client connected from %s:%d", caddrstr, ntohs(caddr.sin_port));
 
-                    int remote_sock = connect_remote(specs[li].remote_host, specs[li].remote_port);
-                    if (remote_sock < 0) {
+                    int remote_sock = -1;
+                    int conn_status = connect_remote_nb(specs[li].remote_host, specs[li].remote_port, &remote_sock);
+                    if (conn_status < 0) {
                         log_conn(cid, "remote connect failed %s:%d", specs[li].remote_host, specs[li].remote_port);
                         close(client_sock);
                         continue;
                     }
-                    set_nonblocking(remote_sock);
                     set_tcp_nodelay(client_sock);
                     set_tcp_nodelay(remote_sock);
                     set_tcp_quickack(client_sock);
                     set_tcp_quickack(remote_sock);
-                    log_conn(cid, "remote connected %s:%d", specs[li].remote_host, specs[li].remote_port);
+                    if (conn_status == 0) {
+                        char laddr[64];
+                        format_local_sockaddr(remote_sock, laddr, sizeof(laddr));
+                        log_conn(cid, "remote connected %s:%d (local %s)", specs[li].remote_host, specs[li].remote_port, laddr);
+                    } else {
+                        char laddr[64];
+                        format_local_sockaddr(remote_sock, laddr, sizeof(laddr));
+                        log_conn(cid, "remote connecting %s:%d (local %s)", specs[li].remote_host, specs[li].remote_port, laddr);
+                    }
 
                     if (free_top <= 0) {
                         log_conn(cid, "Too many connections, dropping client %s", caddrstr);
@@ -642,6 +715,13 @@ int main(int argc, char **argv) {
                     }
                     int idx = free_idxs[--free_top];
                     memset(&conns[idx], 0, sizeof(conns[idx]));
+                    // Mark invalid fds explicitly; fd 0 is a valid value so we must not use it as sentinel.
+                    conns[idx].client_sock = -1;
+                    conns[idx].remote_sock = -1;
+                    conns[idx].p_c2r[0] = -1;
+                    conns[idx].p_c2r[1] = -1;
+                    conns[idx].p_r2c[0] = -1;
+                    conns[idx].p_r2c[1] = -1;
 
                     int p_c2r[2] = {-1, -1};
                     int p_r2c[2] = {-1, -1};
@@ -673,7 +753,8 @@ int main(int argc, char **argv) {
                     clock_gettime(CLOCK_MONOTONIC, &conns[idx].start_ts);
                     conns[idx].last_activity_ts = conns[idx].start_ts;
                     conns[idx].client_read_open = 1;
-                    conns[idx].remote_read_open = 1;
+                    conns[idx].remote_read_open = (conn_status == 0) ? 1 : 0;
+                    conns[idx].remote_connecting = (conn_status == 1) ? 1 : 0;
                     conns[idx].watching_c2r_pw = 0;
                     conns[idx].watching_r2c_pw = 0;
 
@@ -693,6 +774,15 @@ int main(int argc, char **argv) {
                     evc.data.ptr = &conn_ctxs[idx*4];
                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_sock, &evc) != 0) {
                         perror("epoll_ctl ADD client");
+                        close(client_sock);
+                        close(remote_sock);
+                        close(p_c2r[0]); close(p_c2r[1]);
+                        close(p_r2c[0]); close(p_r2c[1]);
+                        memset(&conns[idx], 0, sizeof(conns[idx]));
+                        conns[idx].client_sock = -1;
+                        conns[idx].remote_sock = -1;
+                        free_idxs[free_top++] = idx;
+                        continue;
                     }
                     struct epoll_event evr;
                     memset(&evr, 0, sizeof(evr));
@@ -700,23 +790,35 @@ int main(int argc, char **argv) {
                     evr.data.ptr = &conn_ctxs[idx*4+1];
                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, remote_sock, &evr) != 0) {
                         perror("epoll_ctl ADD remote");
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, client_sock, NULL);
+                        close(client_sock);
+                        close(remote_sock);
+                        close(p_c2r[0]); close(p_c2r[1]);
+                        close(p_r2c[0]); close(p_r2c[1]);
+                        memset(&conns[idx], 0, sizeof(conns[idx]));
+                        conns[idx].client_sock = -1;
+                        conns[idx].remote_sock = -1;
+                        free_idxs[free_top++] = idx;
+                        continue;
                     }
 
                     nconns++;
                     atomic_fetch_add(&g_total_connections, 1);
                     atomic_fetch_add(&g_active_connections, 1);
                 }
-            } else if (ctx->kind == EP_KIND_CLIENT || ctx->kind == EP_KIND_REMOTE) {
-                if (ctx->idx >= 0 && ctx->idx < MAX_CONNECTIONS) to_pump[ctx->idx] = 1;
+            } else if (ctx->kind == EP_KIND_CLIENT) {
+                if (ctx->idx >= 0 && ctx->idx < MAX_CONNECTIONS) pump_flags[ctx->idx] |= 0x01;
+            } else if (ctx->kind == EP_KIND_REMOTE) {
+                if (ctx->idx >= 0 && ctx->idx < MAX_CONNECTIONS) pump_flags[ctx->idx] |= 0x02;
             } else if (ctx->kind == EP_KIND_C2R_PW) {
                 if (ctx->idx >= 0 && ctx->idx < MAX_CONNECTIONS) {
                     conns[ctx->idx].c2r_ingress_blocked = 0;
-                    to_pump[ctx->idx] = 1;
+                    pump_flags[ctx->idx] |= 0x04;
                 }
             } else if (ctx->kind == EP_KIND_R2C_PW) {
                 if (ctx->idx >= 0 && ctx->idx < MAX_CONNECTIONS) {
                     conns[ctx->idx].r2c_ingress_blocked = 0;
-                    to_pump[ctx->idx] = 1;
+                    pump_flags[ctx->idx] |= 0x08;
                 }
             }
         }
@@ -724,19 +826,42 @@ int main(int argc, char **argv) {
         // Pump splice state machines for any connection that had an event
         const unsigned int sflags = SPLICE_F_NONBLOCK;
         for (int idx=0; idx<MAX_CONNECTIONS; idx++) {
-            if (!to_pump[idx]) continue;
+            unsigned char flags = pump_flags[idx];
+            if (!flags) continue;
             conn_pair *c = &conns[idx];
-            if (c->client_sock == 0 && c->remote_sock == 0) continue;
+            if (c->client_sock < 0 && c->remote_sock < 0) continue;
 
             int closed = 0;
             const char *close_reason = NULL;
+
+            // Complete nonblocking connect if needed (remote socket becomes writable when connected or failed).
+            if (c->remote_connecting && (flags & 0x02)) {
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                if (getsockopt(c->remote_sock, SOL_SOCKET, SO_ERROR, &err, &elen) != 0) {
+                    err = errno ? errno : ECONNABORTED;
+                }
+                if (err == 0) {
+                    c->remote_connecting = 0;
+                    c->remote_read_open = 1;
+                    char laddr[64];
+                    format_local_sockaddr(c->remote_sock, laddr, sizeof(laddr));
+                    log_conn(c->conn_id, "remote connected %s (local %s)", c->remote_addr, laddr);
+                } else {
+                    char laddr[64];
+                    format_local_sockaddr(c->remote_sock, laddr, sizeof(laddr));
+                    log_conn(c->conn_id, "remote connect failed (%s) (local %s): %s", c->remote_addr, laddr, strerror(err));
+                    closed = 1;
+                    close_reason = "remote connect failed";
+                }
+            }
 
             // bounded work per wakeup to avoid starvation
             for (int steps=0; steps<64 && !closed; steps++) {
                 int progressed = 0;
 
                 // egress: pipe -> sockets
-                if (c->c2r_in_pipe > 0) {
+                if (!c->remote_connecting && c->c2r_in_pipe > 0) {
                     size_t want = c->c2r_in_pipe;
                     if (want > (size_t)BUF_SIZE) want = (size_t)BUF_SIZE;
                     ssize_t m = splice(c->p_c2r[0], NULL, c->remote_sock, NULL, want, sflags);
@@ -770,7 +895,8 @@ int main(int argc, char **argv) {
                 }
 
                 // ingress: sockets -> pipes
-                if (!closed && c->client_read_open && !c->c2r_ingress_blocked) {
+                // Only attempt ingress if epoll told us the socket is readable, or we were unblocked by pipe-writable.
+                if (!closed && c->client_read_open && !c->c2r_ingress_blocked && (flags & (0x01 | 0x04))) {
                     ssize_t m = splice(c->client_sock, NULL, c->p_c2r[1], NULL, (size_t)BUF_SIZE, sflags);
                     if (m > 0) {
                         c->c2r_in_pipe += (size_t)m;
@@ -784,8 +910,9 @@ int main(int argc, char **argv) {
                         progressed = 1;
                     } else if (m < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            // Likely pipe full; enable an epoll watch on pipe write end to resume.
-                            c->c2r_ingress_blocked = 1;
+                            // Only treat EAGAIN as pipe-backpressure if we *actually* had a socket-read event.
+                            // If we were called here due to "pipe writable" but socket has no data, don't block.
+                            if (flags & 0x01) c->c2r_ingress_blocked = 1;
                         } else if (errno != EINTR) {
                             log_conn(c->conn_id, "splice client->pipe failed");
                             closed = 1;
@@ -793,7 +920,7 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                if (!closed && c->remote_read_open && !c->r2c_ingress_blocked) {
+                if (!closed && c->remote_read_open && !c->r2c_ingress_blocked && (flags & (0x02 | 0x08))) {
                     ssize_t m = splice(c->remote_sock, NULL, c->p_r2c[1], NULL, (size_t)BUF_SIZE, sflags);
                     if (m > 0) {
                         c->r2c_in_pipe += (size_t)m;
@@ -807,7 +934,7 @@ int main(int argc, char **argv) {
                         progressed = 1;
                     } else if (m < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            c->r2c_ingress_blocked = 1;
+                            if (flags & 0x02) c->r2c_ingress_blocked = 1;
                         } else if (errno != EINTR) {
                             log_conn(c->conn_id, "splice remote->pipe failed");
                             closed = 1;
@@ -817,7 +944,7 @@ int main(int argc, char **argv) {
                 }
 
                 // delayed half-close propagation: shutdown after the corresponding pipe drains
-                if (!closed && c->pending_shutdown_remote_wr && c->c2r_in_pipe == 0) {
+                if (!closed && !c->remote_connecting && c->pending_shutdown_remote_wr && c->c2r_in_pipe == 0) {
                     shutdown(c->remote_sock, SHUT_WR);
                     c->pending_shutdown_remote_wr = 0;
                     progressed = 1;
@@ -911,7 +1038,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        free(to_pump);
+        free(pump_flags);
     }
 
     // Unreachable, but keep tidy for future changes.
