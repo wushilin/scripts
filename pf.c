@@ -42,6 +42,8 @@ typedef struct {
     size_t bytes_r2c; // remote -> client
     struct timespec start_ts; // CLOCK_MONOTONIC at accept time
     struct timespec last_activity_ts; // CLOCK_MONOTONIC, updated on any successful relay
+    int client_read_open; // whether client can still send data to us (read side open)
+    int remote_read_open; // whether remote can still send data to us (read side open)
 } conn_pair;
 
 static int g_log_no_time = 0;
@@ -359,10 +361,10 @@ int main(int argc, char **argv) {
         // add active connections
         for (int i=0;i<nconns;i++) {
             fds[nfds].fd = conns[i].client_sock;
-            fds[nfds].events = POLLIN;
+            fds[nfds].events = conns[i].client_read_open ? POLLIN : 0;
             nfds++;
             fds[nfds].fd = conns[i].remote_sock;
-            fds[nfds].events = POLLIN;
+            fds[nfds].events = conns[i].remote_read_open ? POLLIN : 0;
             nfds++;
         }
 
@@ -427,6 +429,8 @@ int main(int argc, char **argv) {
                 conns[nconns].bytes_r2c = 0;
                 clock_gettime(CLOCK_MONOTONIC, &conns[nconns].start_ts);
                 conns[nconns].last_activity_ts = conns[nconns].start_ts;
+                conns[nconns].client_read_open = 1;
+                conns[nconns].remote_read_open = 1;
                 nconns++;
                 atomic_fetch_add(&g_total_connections, 1);
                 atomic_fetch_add(&g_active_connections, 1);
@@ -442,19 +446,49 @@ int main(int argc, char **argv) {
             int n;
 
             // client -> remote
-            if (fds[nbind + i*2].revents & POLLIN) {
+            if (conns[i].client_read_open && (fds[nbind + i*2].revents & POLLIN)) {
                 n = read(conns[i].client_sock, buf, sizeof(buf));
-                if (n<=0) { log_conn(conns[i].conn_id, "client disconnected"); closed=1; close_reason="client disconnect"; }
-                else if (write(conns[i].remote_sock, buf, n)!=n) { log_conn(conns[i].conn_id, "write to remote failed"); closed=1; close_reason="write to remote failed"; }
-                else { conns[i].bytes_c2r += (size_t)n; clock_gettime(CLOCK_MONOTONIC, &conns[i].last_activity_ts); }
+                if (n == 0) {
+                    // Client half-closed (closed its write). Propagate by half-closing remote write.
+                    log_conn(conns[i].conn_id, "client disconnected");
+                    conns[i].client_read_open = 0;
+                    shutdown(conns[i].remote_sock, SHUT_WR);
+                    close_reason = "client disconnect";
+                } else if (n < 0) {
+                    log_conn(conns[i].conn_id, "read from client failed");
+                    closed = 1;
+                    close_reason = "read from client failed";
+                } else if (write(conns[i].remote_sock, buf, n)!=n) {
+                    log_conn(conns[i].conn_id, "write to remote failed");
+                    closed=1;
+                    close_reason="write to remote failed";
+                } else {
+                    conns[i].bytes_c2r += (size_t)n;
+                    clock_gettime(CLOCK_MONOTONIC, &conns[i].last_activity_ts);
+                }
             }
 
             // remote -> client
-            if (!closed && (fds[nbind + i*2 +1].revents & POLLIN)) {
+            if (!closed && conns[i].remote_read_open && (fds[nbind + i*2 +1].revents & POLLIN)) {
                 n = read(conns[i].remote_sock, buf, sizeof(buf));
-                if (n<=0) { log_conn(conns[i].conn_id, "remote disconnected"); closed=1; close_reason="remote disconnect"; }
-                else if (write(conns[i].client_sock, buf, n)!=n) { log_conn(conns[i].conn_id, "write to client failed"); closed=1; close_reason="write to client failed"; }
-                else { conns[i].bytes_r2c += (size_t)n; clock_gettime(CLOCK_MONOTONIC, &conns[i].last_activity_ts); }
+                if (n == 0) {
+                    // Remote half-closed (closed its write). Propagate by half-closing client write.
+                    log_conn(conns[i].conn_id, "remote disconnected");
+                    conns[i].remote_read_open = 0;
+                    shutdown(conns[i].client_sock, SHUT_WR);
+                    close_reason = "remote disconnect";
+                } else if (n < 0) {
+                    log_conn(conns[i].conn_id, "read from remote failed");
+                    closed = 1;
+                    close_reason = "read from remote failed";
+                } else if (write(conns[i].client_sock, buf, n)!=n) {
+                    log_conn(conns[i].conn_id, "write to client failed");
+                    closed=1;
+                    close_reason="write to client failed";
+                } else {
+                    conns[i].bytes_r2c += (size_t)n;
+                    clock_gettime(CLOCK_MONOTONIC, &conns[i].last_activity_ts);
+                }
             }
 
             // idle timeout (no traffic in either direction)
@@ -468,6 +502,12 @@ int main(int argc, char **argv) {
                     closed = 1;
                     close_reason = "idle timeout";
                 }
+            }
+
+            // If both sides have half-closed their write ends, there's no more data to relay.
+            if (!closed && !conns[i].client_read_open && !conns[i].remote_read_open) {
+                closed = 1;
+                if (!close_reason) close_reason = "eof";
             }
 
             if (closed) {
