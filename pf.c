@@ -47,6 +47,8 @@ typedef struct {
 } conn_pair;
 
 static int g_log_no_time = 0;
+static int g_log_no_stats = 0;
+static int g_stats_interval_secs = 30;
 static atomic_llong g_total_connections = 0; // successfully established pairs
 static atomic_int g_active_connections = 0;
 
@@ -127,9 +129,11 @@ static void gen_conn_id(char out[7]) {
 }
 
 static void *stats_thread_main(void *arg) {
-    (void)arg;
+    int interval_secs = *(int *)arg;
+    free(arg);
+    if (interval_secs <= 0) interval_secs = 30;
     while (1) {
-        sleep(10);
+        sleep((unsigned)interval_secs);
         long long total = atomic_load(&g_total_connections);
         int active = atomic_load(&g_active_connections);
         log_msg("stats: total_connections=%lld active_connections=%d", total, active);
@@ -258,9 +262,33 @@ static long long elapsed_ms(const struct timespec *start, const struct timespec 
     return sec * 1000LL + nsec / 1000000LL;
 }
 
+static void print_usage(FILE *out, const char *prog) {
+    fprintf(out,
+            "Usage:\n"
+            "  %s [-h|--help] [-log-no-time] [-log-no-stats] [-stats-interval-secs N] [-idle-timeout-secs N] -L [local_ip:]local_port@remote_host[:remote_port] [-L ...]\n"
+            "\n"
+            "Options:\n"
+            "  -h, --help              Show this help\n"
+            "  -L <spec>               Add a TCP forward rule\n"
+            "                           spec format: [local_ip:]local_port@remote_host[:remote_port]\n"
+            "                           local_ip defaults to 127.0.0.1 if omitted\n"
+            "                           remote_port defaults to local_port if omitted\n"
+            "  -idle-timeout-secs N    Close a connection if no traffic flows in either direction for N seconds\n"
+            "                           Default: -1 (disabled)\n"
+            "  -log-no-time            Omit pf's own timestamp prefix (useful under systemd/journald)\n"
+            "  -log-no-stats           Disable periodic stats logging\n"
+            "  -stats-interval-secs N  Stats logging interval in seconds\n"
+            "                           Default: 30\n"
+            "\n"
+            "Examples:\n"
+            "  %s -L 0.0.0.0:23@mama.wushilin.net:22222\n"
+            "  %s -idle-timeout-secs 5 -log-no-time -L 80@target-host.com:80\n",
+            prog, prog, prog);
+}
+
 int main(int argc, char **argv) {
     if (argc<2) {
-        fprintf(stderr,"Usage: %s [-log-no-time] [-idle-timeout-secs N] -L [local_ip:]local_port@remote_host[:remote_port] [-L ...]\n", argv[0]);
+        print_usage(stderr, argv[0]);
         return 1;
     }
 
@@ -271,8 +299,24 @@ int main(int argc, char **argv) {
     int nbind = 0;
 
     for (int i=1;i<argc;i++) {
-        if (strcmp(argv[i], "-log-no-time")==0) {
+        if (strcmp(argv[i], "-h")==0 || strcmp(argv[i], "--help")==0) {
+            print_usage(stdout, argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "-log-no-time")==0) {
             g_log_no_time = 1;
+        } else if (strcmp(argv[i], "-log-no-stats")==0) {
+            g_log_no_stats = 1;
+        } else if (strcmp(argv[i], "-stats-interval-secs")==0) {
+            if (i+1>=argc) { fprintf(stderr,"-stats-interval-secs requires an integer argument\n"); return 1; }
+            char *end = NULL;
+            errno = 0;
+            long long v = strtoll(argv[i+1], &end, 10);
+            if (errno != 0 || end == argv[i+1] || *end != '\0' || v <= 0 || v > INT_MAX) {
+                fprintf(stderr,"Invalid -stats-interval-secs value: %s\n", argv[i+1]);
+                return 1;
+            }
+            g_stats_interval_secs = (int)v;
+            i++; // consume argument
         } else if (strcmp(argv[i], "-idle-timeout-secs")==0) {
             if (i+1>=argc) { fprintf(stderr,"-idle-timeout-secs requires an integer argument\n"); return 1; }
             char *end = NULL;
@@ -343,11 +387,20 @@ int main(int argc, char **argv) {
     int nfds;
 
     // Start stats thread
-    pthread_t stats_thread;
-    if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) == 0) {
-        pthread_detach(stats_thread);
-    } else {
-        log_msg("warning: failed to start stats thread");
+    if (!g_log_no_stats) {
+        pthread_t stats_thread;
+        int *interval_arg = malloc(sizeof(*interval_arg));
+        if (!interval_arg) {
+            log_msg("warning: failed to start stats thread (malloc)");
+        } else {
+            *interval_arg = g_stats_interval_secs;
+            if (pthread_create(&stats_thread, NULL, stats_thread_main, interval_arg) == 0) {
+                pthread_detach(stats_thread);
+            } else {
+                free(interval_arg);
+                log_msg("warning: failed to start stats thread (pthread_create)");
+            }
+        }
     }
 
     while (1) {
