@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,6 +21,17 @@
 #endif
 
 static const size_t kMaxLineBytes = 32 * 1024; // 32KiB
+
+typedef struct CompressJob {
+  char *path;
+  struct CompressJob *next;
+} CompressJob;
+
+static pthread_mutex_t g_compress_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_compress_cv = PTHREAD_COND_INITIALIZER;
+static CompressJob *g_compress_head = NULL;
+static CompressJob *g_compress_tail = NULL;
+static pthread_once_t g_compress_once = PTHREAD_ONCE_INIT;
 
 static void usage(FILE *out) {
   fprintf(out,
@@ -98,7 +110,7 @@ static void best_effort_unlink(const char *path) {
   // best effort: ignore other failures
 }
 
-static int run_gzip_best_effort(const char *path) {
+static int run_gzip_sync_best_effort(const char *path) {
   // gzip -f PATH
   pid_t pid = fork();
   if (pid < 0) return -1;
@@ -110,6 +122,55 @@ static int run_gzip_best_effort(const char *path) {
   if (waitpid(pid, &status, 0) < 0) return -1;
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
   return -1;
+}
+
+static void *compress_worker(void *arg) {
+  (void)arg;
+  for (;;) {
+    pthread_mutex_lock(&g_compress_mu);
+    while (g_compress_head == NULL) {
+      pthread_cond_wait(&g_compress_cv, &g_compress_mu);
+    }
+    CompressJob *job = g_compress_head;
+    g_compress_head = job->next;
+    if (g_compress_head == NULL) g_compress_tail = NULL;
+    pthread_mutex_unlock(&g_compress_mu);
+
+    (void)run_gzip_sync_best_effort(job->path);
+    free(job->path);
+    free(job);
+  }
+  return NULL;
+}
+
+static void compress_init_once(void) {
+  pthread_t th;
+  if (pthread_create(&th, NULL, compress_worker, NULL) == 0) {
+    (void)pthread_detach(th);
+  }
+}
+
+static void compress_enqueue_best_effort(const char *path) {
+  if (!path) return;
+  (void)pthread_once(&g_compress_once, compress_init_once);
+
+  CompressJob *job = (CompressJob *)calloc(1, sizeof(*job));
+  if (!job) return;
+  job->path = strdup(path);
+  if (!job->path) {
+    free(job);
+    return;
+  }
+
+  pthread_mutex_lock(&g_compress_mu);
+  if (g_compress_tail) {
+    g_compress_tail->next = job;
+    g_compress_tail = job;
+  } else {
+    g_compress_head = g_compress_tail = job;
+  }
+  pthread_cond_signal(&g_compress_cv);
+  pthread_mutex_unlock(&g_compress_mu);
 }
 
 static bool get_file_size_bytes(FILE *f, uint64_t *out) {
@@ -194,7 +255,7 @@ static int rotate_logs(const char *out_path, uint64_t keep_n, bool compress) {
     free(n1gz);
     return -1;
   }
-  if (compress) (void)run_gzip_best_effort(n1);
+  if (compress) compress_enqueue_best_effort(n1);
   free(n1);
   free(n1gz);
   return 0;
@@ -205,32 +266,13 @@ static FILE *open_log_append(const char *path) {
   return f;
 }
 
-static bool read_line_capped(FILE *in, char *buf, size_t buf_sz, size_t *out_len) {
-  // Reads one line (including '\n' if present). Enforces maximum line length of (buf_sz-1).
-  // Returns false on EOF with no bytes read; true otherwise (even if last line has no '\n').
+static bool read_up_to_32k(FILE *in, char *buf, size_t buf_sz, size_t *out_len) {
+  // Reads up to (buf_sz - 1) bytes using fgets (so it stops at '\n' when present),
+  // but does NOT modify or append bytes. For longer lines, this naturally yields multiple chunks.
+  // Returns false only on EOF with no bytes read.
   if (!fgets(buf, (int)buf_sz, in)) return false;
-  size_t len = strlen(buf);
-
-  if (len == 0) return true;
-
-  if (buf[len - 1] == '\n') {
-    *out_len = len;
-    return true;
-  }
-
-  // No newline in buffer: if we hit EOF it's a final line without newline; otherwise it's too long.
-  if (feof(in)) {
-    *out_len = len;
-    return true;
-  }
-
-  // Drain remainder of the long line.
-  int c;
-  while ((c = fgetc(in)) != EOF) {
-    if (c == '\n') break;
-  }
-  errno = EMSGSIZE;
-  return false;
+  *out_len = strlen(buf);
+  return true;
 }
 
 int main(int argc, char **argv) {
@@ -328,12 +370,8 @@ int main(int argc, char **argv) {
 
   while (1) {
     size_t len = 0;
-    if (!read_line_capped(stdin, line, kMaxLineBytes + 2, &len)) {
-      if (feof(stdin)) break;
-      fprintf(stderr, "Input line exceeds 32KiB\n");
-      free(line);
-      fclose(out);
-      return 1;
+    if (!read_up_to_32k(stdin, line, kMaxLineBytes + 1, &len)) {
+      break;
     }
 
     if (len == 0) continue;
@@ -377,4 +415,5 @@ int main(int argc, char **argv) {
   (void)fclose(out);
   return 0;
 }
+
 
