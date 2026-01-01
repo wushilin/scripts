@@ -223,6 +223,43 @@ static uint32_t conn_ep_events_remote(const conn_pair *c) {
     return ev;
 }
 
+// Forward decls used by close_connection()
+void human_bytes(size_t bytes, char *buf, size_t buflen);
+static long long elapsed_ms(const struct timespec *start, const struct timespec *end);
+
+static void close_connection(int epfd, conn_pair *c, int idx,
+                             int *free_idxs, int *free_top, int *nconns,
+                             const char *close_reason) {
+    (void)epfd;
+    // close sockets and pipes (close removes from epoll automatically)
+    if (c->client_sock >= 0) close(c->client_sock);
+    if (c->remote_sock >= 0) close(c->remote_sock);
+    if (c->p_c2r[0] >= 0) close(c->p_c2r[0]);
+    if (c->p_c2r[1] >= 0) close(c->p_c2r[1]);
+    if (c->p_r2c[0] >= 0) close(c->p_r2c[0]);
+    if (c->p_r2c[1] >= 0) close(c->p_r2c[1]);
+
+    char hbuf[64], rbuf[64];
+    human_bytes(c->bytes_c2r, hbuf, sizeof(hbuf));
+    human_bytes(c->bytes_r2c, rbuf, sizeof(rbuf));
+    struct timespec end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &end_ts);
+    long long ms = elapsed_ms(&c->start_ts, &end_ts);
+    log_conn(c->conn_id, "connection closed, uptime %.3fs, bytes: in %s, out %s%s%s",
+             (double)ms / 1000.0, hbuf, rbuf,
+             close_reason ? ", reason: " : "", close_reason ? close_reason : "");
+    atomic_fetch_sub(&g_active_connections, 1);
+
+    memset(c, 0, sizeof(*c));
+    c->client_sock = -1;
+    c->remote_sock = -1;
+    c->p_c2r[0] = c->p_c2r[1] = -1;
+    c->p_r2c[0] = c->p_r2c[1] = -1;
+
+    free_idxs[(*free_top)++] = idx;
+    (*nconns)--;
+}
+
 static void *stats_thread_main(void *arg) {
     int interval_secs = *(int *)arg;
     free(arg);
@@ -660,6 +697,25 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        // If we woke up due to idle-timeout timer (no fd events), enforce idle-timeouts here.
+        // Without this, timeout_ms can become 0 and epoll_wait() will busy-spin.
+        if (n == 0 && idle_timeout_secs >= 0 && nconns > 0) {
+            struct timespec now_ts;
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            long long timeout_ms = idle_timeout_secs * 1000LL;
+            for (int idx=0; idx<MAX_CONNECTIONS; idx++) {
+                conn_pair *c = &conns[idx];
+                if (c->client_sock < 0 && c->remote_sock < 0) continue;
+                long long idle_ms = elapsed_ms(&c->last_activity_ts, &now_ts);
+                if (idle_ms > timeout_ms) {
+                    log_conn(c->conn_id, "idle timeout");
+                    close_connection(epfd, c, idx, free_idxs, &free_top, &nconns, "idle timeout");
+                }
+            }
+            // go back to epoll_wait()
+            continue;
+        }
+
         // track which conns need pumping this round and why:
         // bit0: client socket event, bit1: remote socket event, bit2: c2r pipe write end writable, bit3: r2c pipe write end writable
         unsigned char *pump_flags = calloc((size_t)MAX_CONNECTIONS, 1);
@@ -1015,26 +1071,7 @@ int main(int argc, char **argv) {
             }
 
             if (closed) {
-                // close sockets and pipes (close removes from epoll automatically)
-                close(c->client_sock);
-                close(c->remote_sock);
-                close(c->p_c2r[0]); close(c->p_c2r[1]);
-                close(c->p_r2c[0]); close(c->p_r2c[1]);
-
-                char hbuf[64], rbuf[64];
-                human_bytes(c->bytes_c2r, hbuf, sizeof(hbuf));
-                human_bytes(c->bytes_r2c, rbuf, sizeof(rbuf));
-                struct timespec end_ts;
-                clock_gettime(CLOCK_MONOTONIC, &end_ts);
-                long long ms = elapsed_ms(&c->start_ts, &end_ts);
-                log_conn(c->conn_id, "connection closed, uptime %.3fs, bytes: in %s, out %s%s%s",
-                         (double)ms / 1000.0, hbuf, rbuf,
-                         close_reason ? ", reason: " : "", close_reason ? close_reason : "");
-                atomic_fetch_sub(&g_active_connections, 1);
-
-                memset(c, 0, sizeof(*c));
-                free_idxs[free_top++] = idx;
-                nconns--;
+                close_connection(epfd, c, idx, free_idxs, &free_top, &nconns, close_reason);
             }
         }
 
